@@ -1,175 +1,404 @@
 use std::fmt::Display;
 use std::fs::File;
-use std::{error::Error, process};
+use std::io::Read;
 
-#[derive(Debug, serde::Deserialize)]
-struct BustaPagaItems {
-    Description: String,
-    January: f64,
-    February: f64,
-    March: f64,
-    April: f64,
-    May: f64,
-    June: f64,
-    July: f64,
-    August: f64,
-    September: f64,
-    October: f64,
-    November: f64,
-    December: f64,
-}
+mod combinedresult;
+mod item;
+mod masked_permutation;
+mod permutation;
+mod progress;
+mod singleresult;
+mod sorted_vec;
+mod utils;
 
-struct PermResult {
-    permutation_sign: i32,
-    permutation_select: i32,
-    additional: f64,
-    difference: f64,
-}
+use combinedresult::CombinedResult;
+use item::Item;
+use masked_permutation::MaskedPermutation;
+use permutation::PermutationKey;
+use progress::Progress;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use singleresult::SingleResult;
+use sorted_vec::SortedVec;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::thread;
 
-impl PermResult {
-    fn new(psign: i32, pselect: i32, add: f64, diff: f64) -> Self {
-        PermResult {
-            permutation_sign: psign,
-            permutation_select: pselect,
-            additional: add,
-            difference: diff,
-        }
-    }
-}
-
-impl Default for PermResult {
-    fn default() -> Self {
-        Self {
-            permutation_sign: Default::default(),
-            permutation_select: Default::default(),
-            additional: Default::default(),
-            difference: f64::MAX,
-        }
-    }
-}
-
-impl Display for PermResult {
+impl Display for SortedVec<SingleResult> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // reverse because we shift bits to the right when selecting entries
-        // so displaying this way gives the natural order (left to right)
-        // of payment fields in the order they appear (top to bottom)
-        let rev_sign_perm = format!("{:015b}", self.permutation_sign)
-            .chars()
-            .rev()
-            .collect::<String>();
-        let rev_sele_perm = format!("{:015b}", self.permutation_select)
-            .chars()
-            .rev()
-            .collect::<String>();
-        write!(
-            f,
-            "permutation_sign: {}, permutation_select: {}, additional: {}, difference: {}",
-            rev_sign_perm, rev_sele_perm, self.additional, self.difference
-        )
+        writeln!(f, "Values:")?;
+        for v in &self.data {
+            writeln!(f, "\t{}", v)?;
+        }
+        Ok(())
     }
+}
+
+fn get_total_for_perm(permutation_sign: u32, permutation_select: u32, fields: &[Item]) -> f64 {
+    let mut total = 0_f64;
+    // for each field in the pay slip...
+    for (pay_field_n, pay_field) in fields.iter().enumerate() {
+        // determine if it should be selected
+        let select_field = ((permutation_select >> pay_field_n) & 1) != 0;
+        if !select_field {
+            continue;
+        }
+
+        // determine the sign
+        let make_field_negative = ((permutation_sign >> pay_field_n) & 1) == 0;
+        for month_amount in &pay_field.values {
+            let month_amount_with_sign = if make_field_negative {
+                month_amount * -1_f64
+            } else {
+                *month_amount
+            };
+            total += month_amount_with_sign;
+        }
+    }
+    total
 }
 
 fn find_permutation(
-    busta_paga: &Vec<BustaPagaItems>,
+    fields: &[Item],
     goal: f64,
-    additional: f64,
-) -> Result<PermResult, String> {
-    let mut pay_fields = Vec::new();
-
-    // add items to this structure which is more convenient
-    // it's a vector of tuples (field_name, Vec<f64>)
-    // where the second vector element is the montly value of the field
-    for item in busta_paga {
-        let mut descr_and_months = (item.Description.clone(), Vec::new());
-        descr_and_months.1.extend_from_slice(&[
-            item.January,
-            item.February,
-            item.March,
-            item.April,
-            item.May,
-            item.June,
-            item.July,
-            item.August,
-            item.September,
-            item.October,
-            item.November,
-            item.December,
-        ]);
-        pay_fields.push(descr_and_months);
-    }
-
-    let mut best = PermResult::default();
-
-    let num_fields = pay_fields.len();
+    rank_size: usize,
+) -> Result<SortedVec<SingleResult>, String> {
+    let num_fields = fields.len();
     if num_fields > 31 {
         return Err("Too many fields (max 31 supported)".to_string());
     }
     let all_fields_mask = (1 << num_fields) - 1;
-    println!("Using {:015b} mask", all_fields_mask);
-    let mut perm_count = 0;
+    println!(
+        "Using {:b} mask to compute permutations on {} fields",
+        all_fields_mask, num_fields
+    );
 
-    // with or without the additional value (tender offer)
-    for additional_val in [0 as f64, additional].iter() {
-        // for each field we use this to apply or not the minus sign
-        for permutation_sign in 1..=all_fields_mask {
-            // for each field we use this to consider or not the field
-            for permutation_select in 1..=all_fields_mask {
-                let mut total = *additional_val;
-                perm_count += 1;
+    let field_names: Vec<String> = fields.iter().map(|i| i.name.clone()).collect();
 
-                for (pay_field_n, pay_field) in pay_fields.iter().enumerate() {
-                    let select_field = ((permutation_select >> pay_field_n) & 1) != 0;
-                    let positive_field = ((permutation_sign >> pay_field_n) & 1) != 0;
+    let progress = Progress::new(all_fields_mask);
 
-                    for month_amount in &pay_field.1 {
-                        if select_field {
-                            let sign = if positive_field { 1.0 } else { -1.0 };
-                            total += sign * month_amount;
-                        }
-                    }
-                }
+    let rank = (1_u32..=all_fields_mask)
+        .into_par_iter()
+        .flat_map_iter(|permutation_select| {
+            let progress = progress.clone();
+            progress.tick();
+            MaskedPermutation::from(permutation_select)
+                .map(move |permutation_sign| (permutation_select, permutation_sign))
+        })
+        .map(|(permutation_select, permutation_sign)| {
+            let perm_total = get_total_for_perm(permutation_sign, permutation_select, fields);
+            let err = perm_total - goal;
+            let diff = f64::abs(err);
+            SingleResult::new(
+                field_names.clone(),
+                permutation_sign,
+                permutation_select,
+                all_fields_mask,
+                diff,
+                err,
+            )
+        })
+        .fold(
+            // This closure is called once per thread to produce a brand-new accumulator:
+            || SortedVec::new(rank_size),
+            |mut acc, single_result| {
+                acc.insert_ordered(single_result);
+                acc
+            },
+        )
+        .reduce_with(SortedVec::merged)
+        .unwrap();
 
-                let diff = f64::abs(total - goal);
-                if diff < best.difference {
-                    best = PermResult::new(
-                        permutation_sign,
-                        permutation_select,
-                        *additional_val,
-                        diff,
-                    );
-                }
-                if diff == 0.0 {
-                    println!(
-                        "Returned early for exact match found! After {} permutations",
-                        perm_count
-                    );
-                    return Ok(best);
-                }
-            }
-        }
-    }
-    println!("Returned at the end, after {} permutations", perm_count);
-    Ok(best)
+    Ok(rank)
 }
 
-fn run_cu_solver(goal: f64, additional: f64) -> Result<(), Box<dyn Error>> {
+fn run_cu_solver(
+    filename: &str,
+    goal: f64,
+    rank_size: usize,
+) -> Result<SortedVec<SingleResult>, String> {
     // Build the CSV reader and iterate over each record.
-    let file_reader = File::open("cucalculator.csv")?;
-    let mut rdr = csv::Reader::from_reader(file_reader);
+    let mut file_reader = File::open(filename).expect("not a valid file path");
 
-    let busta_paga: Vec<BustaPagaItems> = rdr.deserialize().collect::<Result<_, _>>()?;
-    let perm_found = find_permutation(&busta_paga, goal, additional)?;
-    println!("Found: {}", perm_found);
-    Ok(())
+    let mut file_content = String::new();
+    let _ = file_reader.read_to_string(&mut file_content);
+
+    let items: Vec<Item> = file_content
+        .lines()
+        .map(|line| {
+            let mut columns = line.split(",");
+            let field_name = columns.next().unwrap();
+            let values = columns.map(|c| c.parse::<f64>().unwrap()).collect();
+            Item {
+                name: field_name.to_string(),
+                values,
+            }
+        })
+        .collect();
+
+    let perm_found = find_permutation(&items, goal, rank_size)?;
+    Ok(perm_found)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let goal: f64 = str::parse(args.get(1).unwrap()).unwrap();
-    let additional: f64 = str::parse(args.get(2).unwrap()).unwrap();
-    println!("Running with goal: {} stocks sold at: {}", goal, additional);
-    if let Err(err) = run_cu_solver(goal, additional) {
-        println!("error running example: {}", err);
-        process::exit(1);
+
+    let default_name = "cal-cu-lator".to_string();
+    let program = args.first().unwrap_or(&default_name);
+    let errmsg =
+        "Usage: {} file_path_1.csv goal_1 rank_size_1  [file_path_2.csv goal_2 rank_size_2 ...]";
+
+    let expected_args = 3;
+    if (args.len() - 1) % expected_args != 0 {
+        panic!("{} {}", errmsg, program);
+    }
+
+    let mut thread_handles = vec![];
+    let mut index = 0;
+    loop {
+        index += 1;
+        if args.get(index).is_none() {
+            break;
+        }
+
+        let file = args.get(index).unwrap().clone();
+        index += 1;
+        let goal: f64 = str::parse(args.get(index).unwrap())
+            .unwrap_or_else(|_| panic!("{} {}", errmsg, program));
+        index += 1;
+        let rank_size: usize = str::parse(args.get(index).unwrap_or(&"10".to_string()))
+            .unwrap_or_else(|_| panic!("{} {}", errmsg, program));
+
+        println!(
+            "Reading from: {:?}\n\nRunning with goal: {}\nrank_size: {}\n\n",
+            file, goal, rank_size
+        );
+        thread_handles.push(thread::spawn(move || {
+            run_cu_solver(file.as_str(), goal, rank_size)
+        }));
+    }
+
+    let mut file_process_results = Vec::new();
+    for handle in thread_handles {
+        match handle.join().unwrap() {
+            Ok(perm_rank) => file_process_results.push(perm_rank),
+            Err(err) => panic!("error running {}: {}", program, err),
+        };
+    }
+
+    let mut combined_results: HashMap<PermutationKey, CombinedResult> = HashMap::new();
+
+    for res in &file_process_results {
+        // join results into combined results
+        for candidate in &res.data {
+            let combined_result_key: PermutationKey = candidate.get_own_key();
+
+            match combined_results.entry(combined_result_key) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().push_diff(candidate.diff);
+                }
+                Entry::Vacant(entry) => {
+                    let mut comb_res = CombinedResult::new(
+                        candidate.field_names.clone(),
+                        candidate.permutation_sign,
+                        candidate.permutation_select,
+                    );
+                    comb_res.push_diff(candidate.diff);
+                    entry.insert(comb_res);
+                }
+            }
+        }
+        println!("\n\nhere is a result {}", res)
+    }
+
+    // TODO we can return before the aggregation above probably
+    if file_process_results.len() == 1 {
+        // nothing to combine
+        return;
+    }
+
+    // sort the combined results
+    let mut sorted_combined_results: SortedVec<CombinedResult> = SortedVec::new(10);
+    for cr in combined_results.into_values() {
+        sorted_combined_results.insert_ordered(cr);
+    }
+
+    for scr in sorted_combined_results.data {
+        println!("combined results: {}", scr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_permutation_empty_input() {
+        let empty_vec: Vec<Item> = Vec::new();
+        let result = find_permutation(&empty_vec, 1000.0, 5);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().data.len(), 0);
+    }
+
+    #[test]
+    fn test_find_permutation_from_input_file() {
+        let filename = "test_data.csv";
+        let goal = 58200.23;
+        let rank_size = 10;
+        let p_rank_result = run_cu_solver(filename, goal, rank_size);
+        assert!(p_rank_result.is_ok());
+        let rank = p_rank_result.unwrap();
+
+        let descriptions = vec![
+            "AAAAA".to_string(),
+            "BBBBB".to_string(),
+            "CCCCC".to_string(),
+            "DDDDD".to_string(),
+            "EEEEE".to_string(),
+            "FFFFF".to_string(),
+            "ADDED".to_string(),
+        ];
+
+        let expected_rank = [
+            SingleResult::new(
+                descriptions.clone(),
+                0b111,
+                0b100111,
+                0b1111111,
+                23.399999999979627,
+                23.399999999979627,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b1100111,
+                0b1111111,
+                0b1111111,
+                25.62999999998283,
+                -25.62999999998283,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b10,
+                0b10110,
+                0b1111111,
+                29.949999999989814,
+                29.949999999989814,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b1110110,
+                0b1111110,
+                0b1111111,
+                45.250000000007276,
+                45.250000000007276,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b10,
+                0b111,
+                0b1111111,
+                82.5800000000163,
+                -82.5800000000163,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b10110,
+                0b110110,
+                0b1111111,
+                89.13000000002648,
+                -89.13000000002648,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b10010,
+                0b10111,
+                0b111111,
+                100.82999999997992,
+                100.82999999997992,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b1100110,
+                0b1101110,
+                0b1111111,
+                138.15999999998894,
+                -138.15999999998894,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b1100111,
+                0b1101111,
+                0b1111111,
+                157.7800000000134,
+                157.7800000000134,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b111,
+                0b110111,
+                0b1111111,
+                160.0100000000166,
+                -160.0100000000166,
+            ),
+        ];
+
+        rank.data.iter().enumerate().for_each(|(i, res)| {
+            let b = expected_rank.get(i).unwrap();
+            assert_eq!(res, b);
+        });
+    }
+
+    #[test]
+    fn test_find_permutation_from_larger_input_file() {
+        let filename = "test_data_larger.csv";
+        let goal = 3110.76;
+        let rank_size = 3;
+        let p_rank_result = run_cu_solver(filename, goal, rank_size);
+        assert!(p_rank_result.is_ok());
+        let rank = p_rank_result.unwrap();
+
+        let descriptions = vec![
+            "AAAAA".to_string(),
+            "BBBBB".to_string(),
+            "CCCCC".to_string(),
+            "DDDDD".to_string(),
+            "EEEEE".to_string(),
+            "FFFFF".to_string(),
+            "GGGGG".to_string(),
+            "HHHHH".to_string(),
+            "IIIII".to_string(),
+            "JJJJJ".to_string(),
+        ];
+
+        let expected_rank = [
+            SingleResult::new(
+                descriptions.clone(),
+                0b10010110,
+                0b1010111110,
+                0b1111111111,
+                0.0000000000004547473508864641,
+                -0.0000000000004547473508864641,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b11000000,
+                0b111110001,
+                0b111111111,
+                0.15999999999939973,
+                0.15999999999939973,
+            ),
+            SingleResult::new(
+                descriptions.clone(),
+                0b1010000,
+                0b1101011100,
+                0b1111111111,
+                0.3400000000001455,
+                0.3400000000001455,
+            ),
+        ];
+
+        rank.data.iter().enumerate().for_each(|(i, res)| {
+            let b = expected_rank.get(i).unwrap();
+            assert_eq!(res, b);
+        });
     }
 }
