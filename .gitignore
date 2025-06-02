@@ -1,6 +1,6 @@
 /target
 .vscode
 *.csv
-!/test_input.csv
+!/test_data*.csv
 *.zst
 
