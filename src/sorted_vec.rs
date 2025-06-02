@@ -51,8 +51,7 @@ where
         }
 
         match self.data.binary_search(&item) {
-            Ok(_) => {} // do not write equivalent permutations
-            Err(pos) => self.data.insert(pos, item),
+            Ok(pos) | Err(pos) => self.data.insert(pos, item),
         }
 
         if self.data.len() > self.size_limit {

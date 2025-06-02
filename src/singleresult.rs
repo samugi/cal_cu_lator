@@ -1,7 +1,6 @@
 use crate::permutation::{Permutation, PermutationKey};
 use std::cmp::Ordering;
 use std::fmt::Display;
-use std::hash::Hash;
 
 #[derive(Debug)]
 pub struct SingleResult {
@@ -64,11 +63,6 @@ impl SingleResult {
             diff,
             error: err,
         }
-    }
-
-    pub fn set_error(&mut self, error: f64) {
-        self.error = error;
-        self.diff = f64::abs(error);
     }
 
     pub fn get_own_key(&self) -> PermutationKey {
